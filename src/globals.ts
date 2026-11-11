@@ -1,45 +1,113 @@
 import * as logger from './logger';
 import type { TracerOptions } from './tracer';
 import type { LambdaContext } from './types/aws/awsEnvironment';
-import { BasicSpan } from './types/spans/basicSpan';
+import { GenericSpan } from './types/spans/basicSpan';
 import {
   getAutoTagKeys,
   getJSONBase64Size,
-  getMaxRequestSize,
+  getMaxSizeForStoredSpansInMemory,
   isLambdaTraced,
   spanHasErrors,
 } from './utils';
 import { GlobalDurationTimer } from './utils/globalDurationTimer';
 import { isString } from '@lumigo/node-core/lib/common';
+import { runOneTimeWrapper } from './utils/functionUtils';
 
 const MAX_TAGS = 50;
 const MAX_TAG_KEY_LEN = 50;
 const MAX_TAG_VALUE_LEN = 70;
 const ADD_TAG_ERROR_MSG_PREFIX = 'Skipping addExecutionTag: Unable to add tag';
 export const DEFAULT_MAX_SIZE_FOR_REQUEST = 1024 * 500;
+export const DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR = 1024 * 990;
+export const DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY =
+  DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR * 10;
 export const MAX_TRACER_ADDED_DURATION_ALLOWED = 750;
 export const MIN_TRACER_ADDED_DURATION_ALLOWED = 200;
 
-export class SpansContainer {
-  private static spans: { [id: string]: BasicSpan } = {};
-  private static currentSpansSize: number = 0;
+const warnSpansSizeOnce = runOneTimeWrapper((threshold: number, currentSize: number) => {
+  logger.info(
+    `Lumigo tracer is no longer collecting data on the invocation - maximum size of total spans collected (${threshold} bytes allowed, current size is ${currentSize} bytes)`
+  );
+}, {});
+export enum DroppedSpanReasons {
+  // If we reached the limit for the size of spans stored in memory while the lambda is running then we will stop collecting spans
+  SPANS_STORED_IN_MEMORY_SIZE_LIMIT = 'SPANS_STORED_IN_MEMORY_SIZE_LIMIT',
 
-  static addSpan(span: BasicSpan): boolean {
-    // Memory optimization
-    if (spanHasErrors(span) || getMaxRequestSize() > this.currentSpansSize) {
+  // If the size of spans we are trying to send to lumigo at the lambda end is bigger than the maximum allowed size
+  // then we will not send some of the spans
+  SPANS_SENT_SIZE_LIMIT = 'SPANS_SENT_SIZE_LIMIT',
+
+  // If the tracer added latency reached the maximum configured, we will stop collecting spans
+  INVOCATION_MAX_LATENCY_LIMIT = 'INVOCATION_MAX_LATENCY_LIMIT',
+}
+
+export type DroppedSpansData = {
+  drops: number;
+};
+
+export class SpansContainer {
+  private static spans: { [id: string]: GenericSpan } = {};
+  private static currentSpansSize: number = 0;
+  private static totalSpans: number = 0;
+  private static droppedSpansReasons: { [reason: string]: DroppedSpansData } = {};
+
+  static addSpan(span: GenericSpan, ignoreSizeLimits: boolean = false): boolean {
+    const newSpan = span.id in this.spans;
+    if (!newSpan) {
+      // We call add span also for updating spans with their end part
+      this.totalSpans += 1;
+    }
+    // Memory optimization, take up to 10x maxSize because of smart span selection logic
+    const maxSpansSize = getMaxSizeForStoredSpansInMemory();
+    if (ignoreSizeLimits || spanHasErrors(span) || this.currentSpansSize <= maxSpansSize) {
       this.spans[span.id] = span;
+
+      // TODO: If the span isn't new we need to subtract the old span size before adding the new size
       this.currentSpansSize += getJSONBase64Size(span);
       logger.debug('Span created', span);
       return true;
     }
+
+    logger.debug('Span was not added due to size limitations', {
+      currentSpansSize: this.currentSpansSize,
+      maxSpansSize,
+    });
+    warnSpansSizeOnce(maxSpansSize, this.currentSpansSize);
+
+    if (newSpan) {
+      SpansContainer.recordDroppedSpan(DroppedSpanReasons.SPANS_STORED_IN_MEMORY_SIZE_LIMIT, false);
+    }
+    // TODO: If the span isn't new we need to mark the existing span as partially dropped / truncated somehow
+
     return false;
   }
 
-  static getSpans(): BasicSpan[] {
+  static recordDroppedSpan(
+    reason: DroppedSpanReasons,
+    incrementTotalSpansCounter: boolean = true,
+    numOfDroppedSpans: number = 1
+  ): void {
+    // Check if the reason exists in the droppedSpansReasons object
+    // If it doesn't exist, initialize
+    if (!this.droppedSpansReasons[reason]) {
+      this.droppedSpansReasons[reason] = { drops: 0 };
+    }
+    this.droppedSpansReasons[reason].drops += numOfDroppedSpans;
+
+    if (incrementTotalSpansCounter) {
+      this.totalSpans += numOfDroppedSpans;
+    }
+  }
+
+  static getDroppedSpansReasons(): { [reason: string]: DroppedSpansData } {
+    return this.droppedSpansReasons;
+  }
+
+  static getSpans(): GenericSpan[] {
     return Object.values(this.spans);
   }
 
-  static getSpanById(spanId: string): BasicSpan | null {
+  static getSpanById(spanId: string): GenericSpan | null {
     return this.spans[spanId];
   }
 
@@ -48,13 +116,20 @@ export class SpansContainer {
     if (oldSpan) {
       oldSpan.id = newId;
       this.spans[newId] = oldSpan;
+      this.totalSpans -= 1;
     }
     delete this.spans[oldId];
   }
 
   static clearSpans(): void {
     this.currentSpansSize = 0;
+    this.totalSpans = 0;
     this.spans = {};
+    this.droppedSpansReasons = {};
+  }
+
+  static getTotalSpans(): number {
+    return this.totalSpans;
   }
 }
 
@@ -199,6 +274,8 @@ export const TracerGlobals = (() => {
     switchOff: false,
     isStepFunction: false,
     maxSizeForRequest: DEFAULT_MAX_SIZE_FOR_REQUEST,
+    maxSizeForRequestOnError: DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR,
+    maxSizeForStoredSpansInMemory: DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
     lambdaTimeout: MAX_TRACER_ADDED_DURATION_ALLOWED,
   };
 
@@ -225,8 +302,17 @@ export const TracerGlobals = (() => {
     switchOff = false,
     stepFunction = false,
     maxSizeForRequest = null,
+    maxSizeForRequestOnError = null,
     lambdaTimeout = MAX_TRACER_ADDED_DURATION_ALLOWED,
-  }: TracerOptions) =>
+    maxSizeForStoredSpansInMemory = DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
+  }: TracerOptions) => {
+    const parsedMaxSizeForRequestOnError =
+      maxSizeForRequestOnError ||
+      (process.env['LUMIGO_MAX_SIZE_FOR_REQUEST_ON_ERROR']
+        ? parseInt(process.env.LUMIGO_MAX_SIZE_FOR_REQUEST_ON_ERROR)
+        : DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR);
+    const parsedMaxSizeForStoredSpansInMemory =
+      maxSizeForStoredSpansInMemory || parsedMaxSizeForRequestOnError * 10;
     Object.assign(tracerInputs, {
       token: token || process.env.LUMIGO_TRACER_TOKEN,
       debug: debug,
@@ -244,7 +330,10 @@ export const TracerGlobals = (() => {
         (process.env['LUMIGO_MAX_SIZE_FOR_REQUEST']
           ? parseInt(process.env.LUMIGO_MAX_SIZE_FOR_REQUEST)
           : DEFAULT_MAX_SIZE_FOR_REQUEST),
+      maxSizeForRequestOnError: parsedMaxSizeForRequestOnError,
+      maxSizeForStoredSpansInMemory: parsedMaxSizeForStoredSpansInMemory,
     });
+  };
 
   const getTracerInputs = () => tracerInputs;
 
@@ -256,6 +345,8 @@ export const TracerGlobals = (() => {
       switchOff: false,
       isStepFunction: false,
       maxSizeForRequest: DEFAULT_MAX_SIZE_FOR_REQUEST,
+      maxSizeForRequestOnError: DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR,
+      maxSizeForStoredSpansInMemory: DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
     });
 
   return {

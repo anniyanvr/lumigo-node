@@ -11,9 +11,37 @@ import { EdgeUrl } from './types/common/edgeTypes';
 import { CommonUtils } from '@lumigo/node-core';
 import { runOneTimeWrapper } from './utils/functionUtils';
 
+type xRayTraceIdFields = {
+  Root: String;
+  transactionId: String;
+  Parent: String;
+  Sampled?: String;
+  Lineage?: String;
+};
+
 export const getRandomId = CommonUtils.getRandomId;
 export const getRandomString = CommonUtils.getRandomString;
 export const md5Hash = CommonUtils.md5Hash;
+
+export const getNodeMajorVersion = (): number => {
+  // Extract Node version from AWS_EXECUTION_ENV
+  const execEnv = process.env.AWS_EXECUTION_ENV || '';
+  const match = execEnv.match(/nodejs(\d+)/);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+  return 0;
+};
+
+/**
+ * Checks if the current Node.js version supports callback-based Lambda handlers.
+ * Callbacks are deprecated starting from Node.js 24.
+ * @returns true if Node < 24 (supports callbacks), false if Node >= 24 (no callback support)
+ */
+export const supportsCallbackHandlers = (): boolean => {
+  return getNodeMajorVersion() < 24;
+};
+
 export const SPAN_PATH = '/api/spans';
 export const LUMIGO_TRACER_EDGE = 'lumigo-tracer-edge.golumigo.com';
 export const LUMIGO_DEFAULT_DOMAIN_SCRUBBERS =
@@ -33,8 +61,12 @@ export const LUMIGO_SECRET_MASKING_REGEX_HTTP_QUERY_PARAMS =
 export const LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT = 'LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT';
 export const LUMIGO_SECRET_MASKING_ALL_MAGIC = 'all';
 
+export const LUMIGO_SECRET_MASKING_DEBUG = 'LUMIGO_SECRET_MASKING_DEBUG';
+
 export const LUMIGO_SECRET_MASKING_EXACT_PATH = 'LUMIGO_SECRET_MASKING_EXACT_PATH';
 export const LUMIGO_WHITELIST_KEYS_REGEXES = 'LUMIGO_WHITELIST_KEYS_REGEXES';
+export const LUMIGO_SUPPORT_LARGE_INVOCATIONS = 'LUMIGO_SUPPORT_LARGE_INVOCATIONS';
+export const LUMIGO_STORED_SPANS_MAX_SIZE_BYTES_ENV_VAR = 'LUMIGO_STORED_SPANS_MAX_SIZE_BYTES';
 export const OMITTING_KEYS_REGEXES = [
   '.*pass.*',
   '.*key.*',
@@ -46,6 +78,19 @@ export const OMITTING_KEYS_REGEXES = [
   'Signature',
   'Credential',
   'Authorization',
+];
+
+export const BYPASS_MASKING_KEYS = [
+  LUMIGO_SECRET_MASKING_REGEX,
+  LUMIGO_SECRET_MASKING_REGEX_BACKWARD_COMP,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_HEADERS,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_BODIES,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_HEADERS,
+  LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_QUERY_PARAMS,
+  LUMIGO_SECRET_MASKING_EXACT_PATH,
+  LUMIGO_SECRET_MASKING_DEBUG,
 ];
 
 export const LUMIGO_EVENT_KEY = '_lumigo';
@@ -95,7 +140,66 @@ export const getTracerInfo = (): { name: string; version: string } => {
   return { name, version };
 };
 
+const xRayFieldKeyValuePattern = /([^;=]+)=([^;=]+)/g;
+
+export const splitXrayTraceIdToFields = (
+  awsXAmznTraceId: string,
+  maxFields: number = 100
+): { [key: string]: string } => {
+  const matches = Array.from(awsXAmznTraceId.matchAll(xRayFieldKeyValuePattern)).slice(
+    0,
+    maxFields
+  );
+  return Object.fromEntries(matches.map((match) => [match[1], match[2]]));
+};
+
+export const getNewFormatTraceId = (awsXAmznTraceId: string): xRayTraceIdFields => {
+  const fields = splitXrayTraceIdToFields(awsXAmznTraceId);
+  const root = fields.Root;
+  if (!root) {
+    throw new Error(
+      `X-Ray trace ID is missing the Root field (_X_AMZN_TRACE_ID=${awsXAmznTraceId})`
+    );
+  }
+  const rootValueSplit = root.split('-');
+  if (rootValueSplit.length < 3) {
+    throw new Error(
+      `X-Ray trace ID Root field is not in the expected format (Root=${fields.Root}, _X_AMZN_TRACE_ID=${awsXAmznTraceId})`
+    );
+  }
+  const transactionId = fields.Root.split('-')[2];
+  // Note: we might not need to generate a Parent field if it's not present,
+  // but for now we'll keep it as is to minimize changes. The python tracer doesn't generate it FYI.
+  const { Parent: parent = getRandomString(16), Sampled: sampled, Lineage: lineage } = fields;
+
+  const parsedTraceId: xRayTraceIdFields = {
+    Root: root,
+    transactionId,
+    Parent: parent,
+  };
+  if (sampled) {
+    parsedTraceId.Sampled = sampled;
+  }
+  if (lineage) {
+    parsedTraceId.Lineage = lineage;
+  }
+
+  return parsedTraceId;
+};
+
 export const getTraceId = (awsXAmznTraceId) => {
+  try {
+    logger.debug(
+      `Parsing the _X_AMZN_TRACE_ID environment variable (_X_AMZN_TRACE_ID = ${awsXAmznTraceId})`
+    );
+    return getNewFormatTraceId(awsXAmznTraceId);
+  } catch (e) {
+    logger.warn(
+      `Failed parsing the _X_AMZN_TRACE_ID environment variable, falling back to legacy parsing implementation (_X_AMZN_TRACE_ID = ${awsXAmznTraceId})`,
+      e
+    );
+  }
+
   try {
     if (!awsXAmznTraceId) {
       throw new Error('Missing _X_AMZN_TRACE_ID environment variable.');
@@ -125,10 +229,7 @@ export const getTraceId = (awsXAmznTraceId) => {
     }
 
     // @ts-ignore
-    const transactionId = traceId.Root.split('-')[2];
-
-    // @ts-ignore
-    traceId.transactionId = transactionId;
+    traceId.transactionId = traceId.Root.split('-')[2];
 
     return traceId;
   } catch (err) {
@@ -181,10 +282,17 @@ export const getTraceId = (awsXAmznTraceId) => {
 
 export const getPatchedTraceId = (awsXAmznTraceId): string => {
   // @ts-ignore
-  const { Root, Parent, Sampled, transactionId } = getTraceId(awsXAmznTraceId);
+  const { Root, Parent, Sampled, transactionId, Lineage } = getTraceId(awsXAmznTraceId);
   const rootArr = Root.split('-');
   const currentTime = Math.floor(Date.now() / 1000).toString(16);
-  return `Root=${rootArr[0]}-${currentTime}-${transactionId};Parent=${Parent};Sampled=${Sampled}`;
+  const patchedTraceId = [`Root=${rootArr[0]}-${currentTime}-${transactionId}`, `Parent=${Parent}`];
+  if (Sampled) {
+    patchedTraceId.push(`Sampled=${Sampled}`);
+  }
+  if (Lineage) {
+    patchedTraceId.push(`Lineage=${Lineage}`);
+  }
+  return patchedTraceId.join(';');
 };
 
 export const isPromise = (obj: any): boolean => typeof obj?.then === 'function';
@@ -227,7 +335,6 @@ const STORE_LOGS_FLAG = 'LUMIGO_STORE_LOGS';
 const TIMEOUT_BUFFER_FLAG = 'LUMIGO_TIMEOUT_BUFFER';
 const TIMEOUT_MIN_DURATION = 'LUMIGO_TIMEOUT_MIN_DURATION';
 const TIMEOUT_BUFFER_FLAG_MS = 'LUMIGO_TIMEOUT_BUFFER_MS';
-const TRACER_TIMEOUT_FLAG = 'LUMIGO_TRACER_TIMEOUT';
 const AGENT_KEEPALIVE = 'LUMIGO_AGENT_KEEPALIVE_MS';
 const REUSE_CONNECTION = 'LUMIGO_REUSE_HTTP_CONNECTION';
 const KEEP_HEADERS = 'LUMIGO_KEEP_HTTP_HEADERS';
@@ -242,6 +349,7 @@ const LUMIGO_STACK_PATTERNS = [
   new RegExp('/node_modules/@lumigo/tracer/', 'i'),
 ];
 
+export const TRACER_TIMEOUT_FLAG = 'LUMIGO_TRACER_TIMEOUT';
 export const SWITCH_OFF_FLAG = 'LUMIGO_SWITCH_OFF';
 
 const validateEnvVar = (envVar: string, value: string = 'TRUE'): boolean =>
@@ -340,6 +448,8 @@ export const isWarm = (): boolean =>
 export const isDebug = (): boolean =>
   validateEnvVar(DEBUG_FLAG) || TracerGlobals.getTracerInputs().debug;
 
+export const isSecretMaskingDebug = (): boolean => validateEnvVar(LUMIGO_SECRET_MASKING_DEBUG);
+
 export const isLambdaWrapped = (): boolean => validateEnvVar(WRAPPED_FLAG);
 
 export const shouldPropagateW3C = (): boolean => !validateEnvVar(LUMIGO_PROPAGATE_W3C, 'FALSE');
@@ -375,6 +485,8 @@ export const getValidAliases = () =>
   })() || [];
 
 export const getMaxRequestSize = () => TracerGlobals.getTracerInputs().maxSizeForRequest;
+export const getMaxRequestSizeOnError = () =>
+  TracerGlobals.getTracerInputs().maxSizeForRequestOnError;
 
 export const getInvokedArn = () => {
   // @ts-ignore
@@ -422,6 +534,8 @@ export const setSwitchOff = () => (process.env['LUMIGO_SWITCH_OFF'] = 'TRUE');
 
 export const setDebug = () => (process.env['LUMIGO_DEBUG'] = 'TRUE');
 
+export const setSecretMaskingDebug = () => (process.env['LUMIGO_SECRET_MASKING_DEBUG'] = 'TRUE');
+
 export const unsetDebug = () => (process.env['LUMIGO_DEBUG'] = undefined);
 
 export const setTimeoutTimerDisabled = () => (process.env[TIMEOUT_ENABLE_FLAG] = 'FALSE');
@@ -430,15 +544,15 @@ export function isString(x: any): x is string {
   return Object.prototype.toString.call(x) === '[object String]';
 }
 
-export const LUMIGO_MAX_ENTRY_SIZE = 2048;
+export const DEFAULT_LUMIGO_MAX_ENTRY_SIZE = 2048;
 
 export const getEventEntitySize = (hasError = false) => {
   const basicSize =
     parseInt(process.env['MAX_EVENT_ENTITY_SIZE']) ||
     parseInt(process.env['LUMIGO_MAX_ENTRY_SIZE']) ||
-    LUMIGO_MAX_ENTRY_SIZE;
+    DEFAULT_LUMIGO_MAX_ENTRY_SIZE;
   if (hasError) {
-    return basicSize * 2;
+    return parseInt(process.env['LUMIGO_MAX_ENTRY_SIZE_ON_ERROR']) || basicSize * 2;
   }
   return basicSize;
 };
@@ -461,7 +575,7 @@ export function isObject(a: any): a is object {
   return !!a && a.constructor === Object;
 }
 
-export const lowerCaseObjectKeys = (o) =>
+export const lowerCaseObjectKeys = (o?: {}) =>
   o ? Object.keys(o).reduce((c, k) => ((c[k.toLowerCase()] = o[k]), c), {}) : {};
 
 export const isAwsService = (host, responseData = undefined): boolean => {
@@ -479,6 +593,14 @@ const isLumigoStackTrace = (input) => {
   return LUMIGO_STACK_PATTERNS.some((word) => word.test(input));
 };
 
+export const removeLumigoFromError = (stacktrace: string) => {
+  const stackArr = stacktrace.split('\n');
+
+  const cleanedStackArr = stackArr.filter((v) => !isLumigoStackTrace(v));
+
+  return cleanedStackArr.join('\n');
+};
+
 export const removeLumigoFromStacktrace = (handleReturnValue) => {
   // Note: this function was copied to the auto-instrument-handler. Keep them both up to date.
   try {
@@ -486,12 +608,7 @@ export const removeLumigoFromStacktrace = (handleReturnValue) => {
     if (!err || !err.stack) {
       return handleReturnValue;
     }
-    const { stack } = err;
-    const stackArr = stack.split('\n');
-
-    const cleanedStack = stackArr.filter((v) => !isLumigoStackTrace(v));
-
-    err.stack = cleanedStack.join('\n');
+    err.stack = removeLumigoFromError(err.stack);
 
     return { err, data, type };
   } catch (err) {
@@ -596,6 +713,27 @@ export function safeExecute<T>(
   };
 }
 
+export function safeExecuteAsync({
+  fn,
+  message = 'Error in Lumigo tracer',
+  logLevel = logger.LOG_LEVELS.WARNING,
+  defaultReturn = undefined,
+}: {
+  fn: Function;
+  message?: string;
+  logLevel?: string;
+  defaultReturn?: any;
+}) {
+  return async function (...args: any[]) {
+    try {
+      return await fn.apply(this, args);
+    } catch (err) {
+      logger.log(logLevel, message, err);
+      return defaultReturn;
+    }
+  };
+}
+
 export const recursiveGetKey = (event, keyToSearch) => {
   return recursiveGetKeyByDepth(event, keyToSearch, recursiveGetKeyDepth());
 };
@@ -650,6 +788,31 @@ export const filterObjectKeys = (
     .reduce((cur, key) => {
       return Object.assign(cur, { [key]: obj[key] });
     }, {});
+
+export const shouldTryZip = () => validateEnvVar(LUMIGO_SUPPORT_LARGE_INVOCATIONS);
+
+const getLumigoStoredSpansMaxSizeBytesOverrideValue = () => {
+  const value = process.env[LUMIGO_STORED_SPANS_MAX_SIZE_BYTES_ENV_VAR];
+  if (value && shouldTryZip()) {
+    const parsedValue = parseInt(value);
+    if (!isNaN(parsedValue)) {
+      return parsedValue;
+    }
+  }
+  return undefined;
+};
+
+/**
+ * The maximum size of all spans stored in memory before sending them to lumigo.
+ * This limit is in place to prevent storing too many spans in memory and causing OOM errors.
+ * Note: when the invocation ends and the spans are processed before sending to Lumigo, more processing and truncating
+ * might take place
+ * @returns number maximum size in bytes
+ */
+export const getMaxSizeForStoredSpansInMemory = (): number => {
+  const overrideValue = getLumigoStoredSpansMaxSizeBytesOverrideValue();
+  return overrideValue || TracerGlobals.getTracerInputs().maxSizeForStoredSpansInMemory;
+};
 
 export const isLambdaTraced = () => isAwsEnvironment() && !isSwitchedOff();
 export const getRequestBodyMaskingRegex = (): string | undefined =>

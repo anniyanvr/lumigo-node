@@ -8,6 +8,7 @@ import {
   EXECUTION_TAGS_KEY,
   getEventEntitySize,
   LUMIGO_SECRET_MASKING_ALL_MAGIC,
+  LUMIGO_SECRET_MASKING_EXACT_PATH,
   LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT,
   LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES,
   LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_HEADERS,
@@ -17,8 +18,23 @@ import {
 } from '../utils';
 import { payloadStringify } from '../utils/payloadStringify';
 import * as awsSpan from './awsSpan';
-import { decodeHttpBody, HTTP_SPAN } from './awsSpan';
+import {
+  decodeHttpBody,
+  ENRICHMENT_SPAN,
+  FUNCTION_SPAN,
+  getSpanMetadata,
+  HTTP_SPAN,
+  MSSQL_SPAN,
+  MYSQL_SPAN,
+  NEO4J_SPAN,
+  PG_SPAN,
+  spansPrioritySorter,
+} from './awsSpan';
 import { addW3CTracePropagator } from '../utils/w3cUtils';
+import { SqlSpanBuilder } from '../../testUtils/sqlSpanBuilder';
+import { MongoSpanBuilder } from '../../testUtils/mongoSpanBuilder';
+import { RedisSpanBuilder } from '../../testUtils/redisSpanBuilder';
+import { PrismaSpanBuilder } from '../../testUtils/prismaSpanBuilder';
 
 const exampleApiGatewayEvent = require('../../testUtils/testdata/events/apigw-request.json');
 
@@ -428,6 +444,36 @@ describe('awsSpan', () => {
     expect(endSpan.envs.length).toBeGreaterThan(startSpan.envs.length);
   });
 
+  test('getEndFunctionSpan does not modify returnValue payload', () => {
+    const functionSpan = {
+      id: '6d26e3c8-60a6-4cee-8a70-f525f47a4caf_started',
+    };
+
+    const handlerReturnValue = {
+      err: null,
+      data: {
+        string: 'value',
+        object: {
+          string: 'value',
+          object: {
+            string: 'value',
+          },
+        },
+      },
+    };
+    process.env[LUMIGO_SECRET_MASKING_EXACT_PATH] =
+      '["string","object.string", "object.object.string"]';
+
+    const endFunctionSpan = awsSpan.getEndFunctionSpan(functionSpan, handlerReturnValue);
+    expect(endFunctionSpan.return_value).toEqual(
+      '{"string":"****","object":{"string":"****","object":{"string":"****"}}}'
+    );
+    // here we expect the original data to be untouched
+    expect(handlerReturnValue.data.string).toEqual('value');
+    expect(handlerReturnValue.data.object.string).toEqual('value');
+    expect(handlerReturnValue.data.object.object.string).toEqual('value');
+  });
+
   test('Lambda invoked by S3 -> shouldnt scrub known S3 fields', () => {
     const { context } = TracerGlobals.getHandlerInputs();
     const event = {
@@ -449,6 +495,29 @@ describe('awsSpan', () => {
     TracerGlobals.setHandlerInputs({ event, context });
     const startSpan = awsSpan.getFunctionSpan(event, context);
     expect(JSON.parse(startSpan.event).Records[0].s3.object.key).toEqual('value');
+  });
+
+  test('Lambda invoked by Lambda -> shouldnt scrub initial event', () => {
+    const { context } = TracerGlobals.getHandlerInputs();
+    const event = {
+      string: 'value',
+      object: {
+        string: 'value',
+        object: {
+          string: 'value',
+        },
+      },
+    };
+    process.env[LUMIGO_SECRET_MASKING_EXACT_PATH] =
+      '["string","object.string", "object.object.string"]';
+    TracerGlobals.setHandlerInputs({ event, context });
+    const startSpan = awsSpan.getFunctionSpan(event, context);
+
+    expect(event.string).toEqual('value');
+    expect(event.object.string).toEqual('value');
+    expect(event.object.object.string).toEqual('value');
+    expect(JSON.parse(startSpan.event).string).toEqual('****');
+    expect(JSON.parse(startSpan.event).object.object.string).toEqual('****');
   });
 
   test('Lambda invoked by DDB stream -> shouldnt scrub known fields', () => {
@@ -523,6 +592,12 @@ describe('awsSpan', () => {
     const s2 = 'xyz';
     const host2 = `${s2}.cloud.google.com`;
     expect(awsSpan.getAwsServiceFromHost(host2)).toEqual(awsSpan.EXTERNAL_SERVICE);
+  });
+
+  test('getAwsServiceFromHost -> account-based dynamodb endpoint', () => {
+    // Current AWS SDKs route DynamoDB to <account-id>.ddb.<region>.amazonaws.com
+    const host = '291070810472.ddb.us-west-2.amazonaws.com';
+    expect(awsSpan.getAwsServiceFromHost(host)).toEqual('dynamodb');
   });
 
   test('getAwsServiceFromHost -> api-gw', () => {
@@ -1068,5 +1143,172 @@ describe('awsSpan', () => {
     const result = decodeHttpBody(httpBody, true);
 
     expect(result).toEqual(body);
+  });
+
+  test.each`
+    input                                                                                        | expectedOutput
+    ${[{ type: HTTP_SPAN, error: 'error' }, { type: FUNCTION_SPAN }, { type: ENRICHMENT_SPAN }]} | ${[{ type: FUNCTION_SPAN }, { type: ENRICHMENT_SPAN }, { type: HTTP_SPAN, error: 'error' }]}
+    ${[{ type: HTTP_SPAN }, { type: HTTP_SPAN, error: 'error' }, { type: FUNCTION_SPAN }]}       | ${[{ type: FUNCTION_SPAN }, { type: HTTP_SPAN, error: 'error' }, { type: HTTP_SPAN }]}
+    ${[{ type: HTTP_SPAN }, { type: 'unknown' }, { type: FUNCTION_SPAN }]}                       | ${[{ type: FUNCTION_SPAN }, { type: HTTP_SPAN }, { type: 'unknown' }]}
+  `('test spansPrioritySorter', ({ input, expectedOutput }) => {
+    input.sort(spansPrioritySorter);
+    expect(input).toEqual(expectedOutput);
+  });
+
+  test.each`
+    input                                                                                                  | expectedOutput
+    ${{ end: 'dummyEnd', type: FUNCTION_SPAN, envs: { firstEnvKey: 'First environment variable value' } }} | ${{ end: 'dummyEnd', type: FUNCTION_SPAN, isMetadata: true }}
+    ${{ end: 'dummyEnd', type: ENRICHMENT_SPAN }}                                                          | ${{ end: 'dummyEnd', type: ENRICHMENT_SPAN, isMetadata: true }}
+    ${{ end: 'dummyEnd', type: ENRICHMENT_SPAN, [EXECUTION_TAGS_KEY]: ['tag1', 'tag2'] }}                  | ${{ end: 'dummyEnd', type: ENRICHMENT_SPAN, isMetadata: true }}
+  `('test getSpanMetadata', ({ input, expectedOutput }) => {
+    const result = getSpanMetadata(input);
+
+    expect(result).toEqual(expectedOutput);
+  });
+
+  test('test getSpanMetadata with http span', () => {
+    const httpSpan = {
+      dummy: 'dummy',
+      type: HTTP_SPAN,
+      info: {
+        httpInfo: {
+          host: 'your.mind.com',
+          request: {
+            host: 'your.mind.com',
+            headers: {
+              'content-type': 'json',
+            },
+            body: JSON.stringify({
+              body: 'aaaaaaaa',
+            }),
+          },
+          response: {
+            headers: {
+              'content-type': 'json',
+            },
+            body: JSON.stringify({
+              longBodyKey: 'body with very long value that we think we need to cut in the middle',
+            }),
+          },
+        },
+      },
+    };
+    const httpSpanMetadata = {
+      dummy: 'dummy',
+      type: HTTP_SPAN,
+      info: {
+        httpInfo: {
+          host: 'your.mind.com',
+          request: {
+            host: 'your.mind.com',
+          },
+          response: {},
+        },
+      },
+      isMetadata: true,
+    };
+
+    const result = getSpanMetadata(httpSpan);
+
+    expect(result).toEqual(httpSpanMetadata);
+  });
+
+  test.each([PG_SPAN, MSSQL_SPAN, MYSQL_SPAN, NEO4J_SPAN])(
+    'test getSpanMetadata with sql span',
+    (spanType) => {
+      const dummyRow = { name: 'LumigoDevMan', dummyNumber: 6 };
+      const sqlSpan = new SqlSpanBuilder()
+        .withType(spanType)
+        .withQuery('SELECT * from users')
+        .withValues(payloadStringify(['123']))
+        .withResponse({ rowCount: 1, rows: payloadStringify(dummyRow) })
+        .build();
+      const sqlSpanMetadata = new SqlSpanBuilder()
+        .withType(spanType)
+        .withQuery('SELECT * from users')
+        .withValues(payloadStringify(['123']))
+        .withResponse({ rowCount: 1, rows: payloadStringify(dummyRow) })
+        .onlyMetadata()
+        .build();
+
+      const result = getSpanMetadata(sqlSpan);
+
+      expect(result).toEqual(sqlSpanMetadata);
+    }
+  );
+
+  test('test getSpanMetadata with mongo span', () => {
+    const mongoSpan = new MongoSpanBuilder()
+      .withRequest(
+        '{"insert":"documents","documents":[{"a":1},{"a":2},{"a":3}],"ordered":true,"lsid":{"id":"2"},"txnNumber":1,"$clusterTime":{"clusterTime":123,"signature":"****"},"$db":"TracerDB"}'
+      )
+      .withResponse(
+        '{"n":1,"opTime":{"ts":123456,"t":3},"electionId":7,"ok":1,"$clusterTime":{"clusterTime":123456,"signature":"****"},"operationTime":12345}'
+      )
+      .withDatabaseName('TracerDB')
+      .withCommandName('insert')
+      .build();
+
+    const mongoSpanMetadata = new MongoSpanBuilder()
+      .withRequest(
+        '{"insert":"documents","documents":[{"a":1},{"a":2},{"a":3}],"ordered":true,"lsid":{"id":"2"},"txnNumber":1,"$clusterTime":{"clusterTime":123,"signature":"****"},"$db":"TracerDB"}'
+      )
+      .withResponse(
+        '{"n":1,"opTime":{"ts":123456,"t":3},"electionId":7,"ok":1,"$clusterTime":{"clusterTime":123456,"signature":"****"},"operationTime":12345}'
+      )
+      .withDatabaseName('TracerDB')
+      .withCommandName('insert')
+      .onlyMetadata()
+      .build();
+
+    const result = getSpanMetadata(mongoSpan);
+
+    expect(result).toEqual(mongoSpanMetadata);
+  });
+
+  test('test getSpanMetadata with redis span', () => {
+    const dummyConnectionOptions = {
+      host: 'tracer-test-cluster.1meza6.ng.0001.usw1.cache.amazonaws.com',
+      port: '6379',
+    };
+    const redisSpan = new RedisSpanBuilder()
+      .withConnectionOptions(dummyConnectionOptions)
+      .withRequestCommand('set')
+      .withRequestArgs('["Key","Value"]')
+      .withResponse(`"OK"`)
+      .build();
+
+    const redisSpanMetadata = new RedisSpanBuilder()
+      .withConnectionOptions(dummyConnectionOptions)
+      .withRequestCommand('set')
+      .withRequestArgs('["Key","Value"]')
+      .withResponse(`"OK"`)
+      .onlyMetadata()
+      .build();
+
+    const result = getSpanMetadata(redisSpan);
+
+    expect(result).toEqual(redisSpanMetadata);
+  });
+
+  test('test getSpanMetadata with prisma span', () => {
+    const prismaSpan = new PrismaSpanBuilder()
+      .withModel('User')
+      .withOperation('count')
+      .withQueryArgs('{"where":{"id":123456}}')
+      .withResult('0')
+      .build();
+
+    const prismaSpanMetadata = new PrismaSpanBuilder()
+      .withModel('User')
+      .withOperation('count')
+      .withQueryArgs('{"where":{"id":123456}}')
+      .withResult('0')
+      .onlyMetadata()
+      .build();
+
+    const result = getSpanMetadata(prismaSpan);
+
+    expect(result).toEqual(prismaSpanMetadata);
   });
 });

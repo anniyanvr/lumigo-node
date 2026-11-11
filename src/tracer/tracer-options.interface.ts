@@ -5,6 +5,8 @@ export interface TracerOptions {
   switchOff?: boolean;
   stepFunction?: boolean;
   maxSizeForRequest?: number | null;
+  maxSizeForRequestOnError?: number | null;
   lambdaTimeout?: number;
   verbose?: boolean;
+  maxSizeForStoredSpansInMemory?: number;
 }

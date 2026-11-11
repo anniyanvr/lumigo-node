@@ -13,7 +13,7 @@ import {
   sqsParser,
 } from '../parsers/aws';
 import { getSkipScrubPath, parseEvent } from '../parsers/eventParser';
-import { BasicChildSpan, BasicSpan, SpanInfo } from '../types/spans/basicSpan';
+import { BasicChildSpan, BasicSpan, GenericSpan, SpanInfo } from '../types/spans/basicSpan';
 import { FunctionSpan } from '../types/spans/functionSpan';
 import { HttpInfo } from '../types/spans/httpSpan';
 import {
@@ -26,19 +26,18 @@ import {
   getInvokedVersion,
   getTraceId,
   getTracerInfo,
-  INVOCATION_ID_KEY,
   isAwsService,
   isString,
   isWarm,
   parseErrorObject,
   safeExecute,
-  SENDING_TIME_ID_KEY,
   setWarm,
-  TRANSACTION_ID_KEY,
+  spanHasErrors,
 } from '../utils';
 import { payloadStringify, shallowMask, truncate } from '../utils/payloadStringify';
 import { Utf8Utils } from '../utils/utf8Utils';
 import { getW3CMessageId } from '../utils/w3cUtils';
+import { RequestData, ResponseData } from '../hooks/baseHttp';
 
 export const HTTP_SPAN = 'http';
 export const FUNCTION_SPAN = 'function';
@@ -50,6 +49,7 @@ export const MSSQL_SPAN = 'msSql';
 export const MYSQL_SPAN = 'mySql';
 export const NEO4J_SPAN = 'neo4j';
 export const ENRICHMENT_SPAN = 'enrichment';
+export const PRISMA_SPAN = 'prisma';
 
 export const getSpanInfo = (): SpanInfo => {
   const tracer = getTracerInfo();
@@ -63,6 +63,71 @@ export const getSpanInfo = (): SpanInfo => {
   const traceId = getTraceId(awsXAmznTraceId);
 
   return { traceId, tracer, logGroupName, logStreamName };
+};
+
+export const getSpanPriority = (span): number => {
+  if (span.type === FUNCTION_SPAN) {
+    return 0;
+  }
+  if (span.type === ENRICHMENT_SPAN) {
+    return 1;
+  }
+  if (spanHasErrors(span)) {
+    return 2;
+  }
+  return 3;
+};
+
+export const spansPrioritySorter = (span1: any, span2: any): number => {
+  return Math.sign(getSpanPriority(span1) - getSpanPriority(span2));
+};
+
+export const getSpanMetadata = (span: GenericSpan): GenericSpan => {
+  const spanCopy = JSON.parse(JSON.stringify(span));
+  spanCopy['isMetadata'] = true;
+
+  if (spanCopy.type === FUNCTION_SPAN) {
+    delete spanCopy?.envs;
+    return spanCopy;
+  } else if (spanCopy.type === ENRICHMENT_SPAN) {
+    delete spanCopy?.[EXECUTION_TAGS_KEY];
+    return spanCopy;
+  } else if (spanCopy.type === HTTP_SPAN) {
+    delete spanCopy?.info?.httpInfo?.request?.headers;
+    delete spanCopy?.info?.httpInfo?.request?.body;
+    delete spanCopy?.info?.httpInfo?.response?.headers;
+    delete spanCopy?.info?.httpInfo?.response?.body;
+    return spanCopy;
+  } else if (spanCopy.type === MONGO_SPAN) {
+    delete spanCopy?.request;
+    delete spanCopy?.response;
+    return spanCopy;
+  } else if (spanCopy.type === REDIS_SPAN) {
+    delete spanCopy?.requestArgs;
+    delete spanCopy?.response;
+    return spanCopy;
+  } else if (spanCopy.type === NEO4J_SPAN) {
+    delete spanCopy?.summary;
+    delete spanCopy?.query;
+    delete spanCopy?.values;
+    delete spanCopy?.response;
+    return spanCopy;
+  } else if (
+    spanCopy.type === PG_SPAN ||
+    spanCopy.type === MYSQL_SPAN ||
+    spanCopy.type === MSSQL_SPAN
+  ) {
+    delete spanCopy?.query;
+    delete spanCopy?.values;
+    delete spanCopy?.response;
+    return spanCopy;
+  } else if (spanCopy.type === PRISMA_SPAN) {
+    delete spanCopy?.queryArgs;
+    delete spanCopy?.result;
+    return spanCopy;
+  }
+  logger.warn(`Got unknown span type: ${spanCopy.type}`);
+  return spanCopy;
 };
 
 export const getCurrentTransactionId = (): string => {
@@ -122,27 +187,6 @@ export const getBasicSpan = (id: string, transactionId: string): BasicSpan => {
   };
 };
 
-export const generateEnrichmentSpan = (
-  executionTags: any[],
-  token: string,
-  transactionId: string,
-  invocationId: string
-) => {
-  if (executionTags.length === 0) {
-    return null;
-  }
-  const enrichmentSpan = {
-    type: ENRICHMENT_SPAN,
-    token: token,
-    [TRANSACTION_ID_KEY]: transactionId,
-    [INVOCATION_ID_KEY]: invocationId,
-    [EXECUTION_TAGS_KEY]: executionTags,
-    [SENDING_TIME_ID_KEY]: new Date().getTime(),
-  };
-  logger.debug('Enrichment span created', enrichmentSpan);
-  return enrichmentSpan;
-};
-
 const getEventForSpan = (hasError: boolean = false): string => {
   const event = TracerGlobals.getHandlerInputs().event;
   return payloadStringify(
@@ -191,12 +235,12 @@ export const getFunctionSpan = (lambdaEvent: {}, lambdaContext: Context): Functi
 
 export const removeStartedFromId = (id) => id.split('_')[0];
 
-export const getEndFunctionSpan = (functionSpan, handlerReturnValue) => {
+export const getEndFunctionSpan = (functionSpan: GenericSpan, handlerReturnValue): GenericSpan => {
   const { err, data } = handlerReturnValue;
   const id = removeStartedFromId(functionSpan.id);
   let error = err ? parseErrorObject(err) : undefined;
   const ended = new Date().getTime();
-  let returnValue;
+  let returnValue: any;
   try {
     returnValue = payloadStringify(data);
   } catch (e) {
@@ -232,6 +276,12 @@ export const getAwsServiceFromHost = (host = '') => {
     return service;
   }
 
+  // Account-based DynamoDB endpoints put the account id in the first label:
+  // <account-id>.ddb.<region>.amazonaws.com. Current AWS SDKs route DynamoDB there
+  // by default (accountIdEndpointMode defaults to 'preferred'), so matching only the
+  // first label would classify the call as an external service.
+  if (host.split('.')[1] === 'ddb') return 'dynamodb';
+
   if (host.includes('execute-api')) return 'apigw';
 
   return EXTERNAL_SERVICE;
@@ -246,6 +296,7 @@ export type ServiceData = {
   messageId?: string;
   [key: string]: any;
 };
+
 export const getServiceData = (requestData, responseData): ServiceData => {
   const { host } = requestData;
 
@@ -278,7 +329,7 @@ export const decodeHttpBody = (httpBody: any, hasError: boolean): any | string =
   return httpBody;
 };
 
-export const getHttpInfo = (requestData, responseData): HttpInfo => {
+export const getHttpInfo = (requestData: RequestData, responseData): HttpInfo => {
   const { host } = requestData;
   const request = Object.assign({}, requestData);
   const response = Object.assign({}, responseData);
@@ -312,8 +363,8 @@ export const getHttpSpan = (
   transactionId,
   awsRequestId,
   randomRequestId,
-  requestData,
-  responseData = { truncated: false, body: undefined, headers: undefined }
+  requestData: RequestData,
+  responseData: ResponseData = { truncated: false, body: undefined, headers: undefined }
 ) => {
   let serviceData = {};
   try {
@@ -347,10 +398,7 @@ export const getHttpSpan = (
     HTTP_SPAN
   );
 
-  let info = Object.assign({}, basicHttpSpan.info, {
-    httpInfo,
-    ...awsServiceData,
-  });
+  const info = Object.assign({}, basicHttpSpan.info, { httpInfo }, awsServiceData);
 
   // add messageId based on W3cContextPropagation in case of messageId not present
   if (!info.messageId) {

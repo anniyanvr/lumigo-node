@@ -3,9 +3,16 @@ import {
   LUMIGO_SECRET_MASKING_ALL_MAGIC,
   LUMIGO_SECRET_MASKING_EXACT_PATH,
   LUMIGO_SECRET_MASKING_REGEX,
+  OMITTING_KEYS_REGEXES,
   LUMIGO_SECRET_MASKING_REGEX_BACKWARD_COMP,
   LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES,
   LUMIGO_WHITELIST_KEYS_REGEXES,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_HEADERS,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_BODIES,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_HEADERS,
+  LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT,
+  LUMIGO_SECRET_MASKING_REGEX_HTTP_QUERY_PARAMS,
+  LUMIGO_SECRET_MASKING_DEBUG,
 } from '../utils';
 import { keyToOmitRegexes, payloadStringify, shallowMask, truncate } from './payloadStringify';
 import { ConsoleWritesForTesting } from '../../testUtils/consoleMocker';
@@ -76,6 +83,12 @@ describe('payloadStringify', () => {
     expect(result).toEqual('');
   });
 
+  test('handles BigInt', () => {
+    const result = payloadStringify({ some: BigInt(345) });
+
+    expect(result).toEqual('{"some":"345"}');
+  });
+
   test('payloadStringify -> truncate all', () => {
     const payload = { a: 2, b: 3 };
 
@@ -99,6 +112,43 @@ describe('payloadStringify', () => {
     const result = payloadStringify(payload);
 
     expect(result).toEqual('{"a":2,"password":"****"}');
+  });
+
+  test.each(
+    [
+      LUMIGO_SECRET_MASKING_REGEX,
+      LUMIGO_SECRET_MASKING_REGEX_BACKWARD_COMP,
+      LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES,
+      LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_HEADERS,
+      LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_BODIES,
+      LUMIGO_SECRET_MASKING_REGEX_HTTP_RESPONSE_HEADERS,
+      LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT,
+      LUMIGO_SECRET_MASKING_REGEX_HTTP_QUERY_PARAMS,
+      LUMIGO_SECRET_MASKING_EXACT_PATH,
+      LUMIGO_SECRET_MASKING_DEBUG,
+    ],
+    'payloadStringify -> should not mask masking the env-var %s',
+    (envVar) => {
+      const someValue = 'a';
+
+      expect(payloadStringify({ [envVar]: someValue })).toEqual(`{"${env}":"${someValue}"}`);
+    }
+  );
+
+  test('payloadStringify -> LUMIGO_SECRET_MASKING_REGEX', () => {
+    process.env[LUMIGO_SECRET_MASKING_REGEX] = JSON.stringify(['.*masking.*']);
+    const payload = {
+      a: 2,
+      aMaskingB: 'CoolPass35',
+      LUMIGO_SECRET_MASKING_REGEX: 'should not be masked',
+    };
+
+    const result = payloadStringify(payload);
+
+    expect(result).toEqual(
+      '{"a":2,"aMaskingB":"****","LUMIGO_SECRET_MASKING_REGEX":"should not be masked"}'
+    );
+    process.env[LUMIGO_SECRET_MASKING_REGEX] = undefined;
   });
 
   test('payloadStringify -> truncate after 10B', () => {
@@ -292,6 +342,48 @@ describe('payloadStringify', () => {
     expect(shallowMask('requestBody', { a: 'b', aXy: 'bla' })).toEqual({ a: 'b', aXy: '****' });
   });
 
+  test('shallowMask -> regex should be case-insensitive', () => {
+    // requestBody
+    process.env[LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES] = '[".*X.*"]';
+    expect(shallowMask('requestBody', { a: 'b', axy: 'bla' })).toEqual({ a: 'b', axy: '****' });
+
+    // environment
+    process.env[LUMIGO_SECRET_MASKING_REGEX_ENVIRONMENT] = '[".*X.*"]';
+    expect(
+      shallowMask('environment', {
+        a: 'b',
+        axy: 'some secret',
+      })
+    ).toEqual({
+      a: 'b',
+      axy: '****',
+    });
+
+    // fallback to defaults, should also be case-insensitive
+    delete process.env[LUMIGO_SECRET_MASKING_REGEX_HTTP_REQUEST_BODIES];
+    expect(shallowMask('requestBody', { a: 'b', PaSSwoRd: 'bla' })).toEqual({
+      a: 'b',
+      PaSSwoRd: '****',
+    });
+  });
+
+  test('shallowMask -> requestBody -> regex -> bypass', () => {
+    const regex = '[".*X.*"]';
+    process.env[LUMIGO_SECRET_MASKING_REGEX] = regex;
+
+    expect(
+      shallowMask('environment', {
+        LUMIGO_SECRET_MASKING_REGEX: regex,
+        a: 'b',
+        aXy: 'some secret',
+      })
+    ).toEqual({
+      LUMIGO_SECRET_MASKING_REGEX: regex,
+      a: 'b',
+      aXy: '****',
+    });
+  });
+
   test('shallowMask -> requestBody -> fallback', () => {
     expect(shallowMask('requestBody', { a: 'b', password: 'bla' })).toEqual({
       a: 'b',
@@ -307,7 +399,13 @@ describe('payloadStringify', () => {
     utils.setDebug();
     TracerGlobals.setTracerInputs({});
     expect(shallowMask('requestBody', 1)).toEqual(1);
-    expect(ConsoleWritesForTesting.getLogs()).toEqual([
+
+    // Filter logs to only include WARNING logs
+    const warningLogs = ConsoleWritesForTesting.getLogs().filter((log) =>
+      log.msg.includes('WARNING')
+    );
+
+    expect(warningLogs).toEqual([
       {
         msg: '#LUMIGO# - WARNING - "Failed to mask payload, payload is not an object or string"',
         obj: '1',
@@ -319,12 +417,54 @@ describe('payloadStringify', () => {
     utils.setDebug();
     TracerGlobals.setTracerInputs({});
     expect(shallowMask('other', { a: 'b', password: 1234 })).toEqual({ a: 'b', password: '****' });
-    expect(ConsoleWritesForTesting.getLogs()).toEqual([
-      {
+
+    // Filter logs to only include WARNING logs
+    const warningLogs = ConsoleWritesForTesting.getLogs().filter((log) =>
+      log.msg.includes('WARNING')
+    );
+
+    expect(warningLogs).toEqual([
+      expect.objectContaining({
         msg: '#LUMIGO# - WARNING - "Unknown context for shallowMask"',
-        obj: '"other"',
-      },
+      }),
     ]);
+  });
+
+  test('shallowMask -> requestBody -> LUMIGO_SECRET_MASKING_REGEX -> bad regex', () => {
+    utils.setDebug();
+    process.env[LUMIGO_SECRET_MASKING_REGEX] = '["a(a"]';
+    expect(shallowMask('requestBody', { a: 'b', aa: 'bla' })).toEqual({ a: 'b', aa: 'bla' });
+
+    // Filter logs to only include WARNING logs
+    const warningLogs = ConsoleWritesForTesting.getLogs().filter((log) =>
+      log.msg.includes('WARNING')
+    );
+
+    expect(warningLogs).toEqual([
+      expect.objectContaining({
+        msg: '#LUMIGO# - WARNING - "Failed to parse the given masking regex"',
+      }),
+      expect.objectContaining({
+        msg: '#LUMIGO# - WARNING - "Fallback to default regexes list"',
+      }),
+    ]);
+  });
+
+  test('shallowMask -> LUMIGO_SECRET_MASKING_DEBUG', () => {
+    utils.setDebug();
+    utils.setSecretMaskingDebug();
+
+    expect(shallowMask('requestBody', { a: 'b' })).toEqual({ a: 'b' });
+
+    const debugLogs = ConsoleWritesForTesting.getLogs().filter((log) => log.msg.includes('DEBUG'));
+
+    expect(debugLogs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          msg: '#LUMIGO# - DEBUG - "Shallow masking payload"',
+        }),
+      ])
+    );
   });
 
   test.each`

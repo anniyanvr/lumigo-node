@@ -1,3 +1,5 @@
+import { HttpInfo } from './httpSpan';
+
 export type Vendor = 'AWS';
 
 export interface SpanInfo {
@@ -10,9 +12,14 @@ export interface SpanInfo {
   logStreamName: string;
 }
 
-export interface BasicSpan {
+export interface GenericSpan {
   id: string;
-  info: SpanInfo;
+  [key: string]: any;
+}
+
+export interface BasicSpan extends GenericSpan {
+  id: string;
+  info: SpanInfo | { httpInfo: HttpInfo };
   vendor: Vendor;
   transactionId: string;
   account: string;

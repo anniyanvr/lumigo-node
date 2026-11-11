@@ -17,7 +17,7 @@ import {
   isEmptyString,
   isEncodingType,
   isObject,
-  LUMIGO_MAX_ENTRY_SIZE,
+  DEFAULT_LUMIGO_MAX_ENTRY_SIZE,
   parseErrorObject,
   parseQueryParams,
   recursiveGetKey,
@@ -28,6 +28,15 @@ import {
   shouldPropagateW3C,
   shouldScrubDomain,
   getTraceId,
+  safeExecuteAsync,
+  getMaxSizeForStoredSpansInMemory,
+  LUMIGO_STORED_SPANS_MAX_SIZE_BYTES_ENV_VAR,
+  LUMIGO_SUPPORT_LARGE_INVOCATIONS,
+  removeLumigoFromError,
+  removeLumigoFromStacktrace,
+  LUMIGO_SECRET_MASKING_DEBUG,
+  getNodeMajorVersion,
+  supportsCallbackHandlers,
 } from './utils';
 
 describe('utils', () => {
@@ -126,6 +135,80 @@ describe('utils', () => {
       Sampled: '1',
       transactionId: '613d623b633d643b653d6661',
     });
+
+    const fields = utils.getTraceId(
+      'Root=1-670d0060-1b85fdcd75ed1c2557382245;Lineage=1:aba0be3a:0'
+    );
+    expect(fields.Root).toEqual('1-670d0060-1b85fdcd75ed1c2557382245');
+    expect(fields.transactionId).toEqual('1b85fdcd75ed1c2557382245');
+    expect(fields.Lineage).toEqual('1:aba0be3a:0');
+    expect(fields.Parent).toBeTruthy();
+
+    // Invalid root value, the new parser should fail and then be handled by the legacy parser
+    const invalidRootTraceId = 'Root=6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1';
+    expect(utils.getTraceId(invalidRootTraceId)).toEqual({
+      Parent: '59fa1aeb03c2ec1f',
+      Root: '6ac46730d346cad0e53f89d0',
+      Sampled: '1',
+      // Note: the current implementation splits the root by `-` and uses the third part as the transactionId. If there isn't a third part it sets it as undefined.
+      transactionId: undefined,
+    });
+
+    // Invalid root value, the new parser should fail and then be handled by the legacy parser
+    const invalidAndShortTraceId = 'Root=6ac46730d346cad0e53f89d0';
+    expect(utils.getTraceId(invalidAndShortTraceId)).toEqual({
+      // Static values generated based on the x-ray trace id value
+      Parent: '526f6f743d36616334363733',
+      Root: '26f6f74',
+      Sampled: '1',
+      transactionId: '526f6f743d36616334363733',
+    });
+
+    // The x-ray value is too long, too many fields. We should parse it as usual
+    const longXrayId = [
+      'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1',
+      ...Array(1000)
+        .fill(0)
+        .map((_, i) => `${i}=${i}`),
+    ].join(';');
+    expect(utils.getTraceId(longXrayId)).toEqual({
+      Parent: '59fa1aeb03c2ec1f',
+      Root: '1-5b1d2450-6ac46730d346cad0e53f89d0',
+      Sampled: '1',
+      transactionId: '6ac46730d346cad0e53f89d0',
+    });
+  });
+
+  test.each`
+    xrayTraceId                                                                                          | expected
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1'}                      | ${{ Root: '1-5b1d2450-6ac46730d346cad0e53f89d0', Parent: '59fa1aeb03c2ec1f', Sampled: '1' }}
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f'}                                | ${{ Root: '1-5b1d2450-6ac46730d346cad0e53f89d0', Parent: '59fa1aeb03c2ec1f' }}
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0'}                                                        | ${{ Root: '1-5b1d2450-6ac46730d346cad0e53f89d0' }}
+    ${'Root=1-670d0060-1b85fdcd75ed1c2557382245;Lineage=1:aba0be3a:0'}                                   | ${{ Root: '1-670d0060-1b85fdcd75ed1c2557382245', Lineage: '1:aba0be3a:0' }}
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1;Lineage=1:aba0be3a:0'} | ${{ Root: '1-5b1d2450-6ac46730d346cad0e53f89d0', Parent: '59fa1aeb03c2ec1f', Sampled: '1', Lineage: '1:aba0be3a:0' }}
+    ${';;;;;;;;;'}                                                                                       | ${{}}
+    ${''}                                                                                                | ${{}}
+    ${'========='}                                                                                       | ${{}}
+    ${'=;=;=;=;'}                                                                                        | ${{}}
+    ${';;;;;===='}                                                                                       | ${{}}
+  `('splitXrayTraceIdToFields', ({ xrayTraceId, expected }) => {
+    expect(utils.splitXrayTraceIdToFields(xrayTraceId)).toEqual(expected);
+  });
+
+  test('splitXrayTraceIdToFields - too many fields', () => {
+    let longXrayId = Array(1000)
+      .fill(0)
+      .map((_, i) => `${i}=${i}`)
+      .join(';');
+
+    const expectedFields = {};
+    for (let i = 0; i < 100; i++) {
+      expectedFields[`${i}`] = `${i}`;
+    }
+
+    const fields = utils.splitXrayTraceIdToFields(longXrayId);
+
+    expect(fields).toEqual(expectedFields);
   });
 
   test('isObject', () => {
@@ -138,20 +221,22 @@ describe('utils', () => {
     expect(isObject({})).toEqual(true);
   });
 
-  test('getPatchedTraceId', () => {
-    const awsXAmznTraceId =
-      'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1';
-    const expectedRoot = 'Root=1';
-    const expectedSuffix = '6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1';
-
+  test.each`
+    awsXAmznTraceId                                                                                      | patchedTraceIdPrefix | patchedTraceIdSuffix
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1'}                      | ${'Root=1'}          | ${'6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1'}
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f'}                                | ${'Root=1'}          | ${'6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f'}
+    ${'Root=1-5b1d2450-6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1;Lineage=1:c01ac717:0'} | ${'Root=1'}          | ${'6ac46730d346cad0e53f89d0;Parent=59fa1aeb03c2ec1f;Sampled=1;Lineage=1:c01ac717:0'}
+  `('getPatchedTraceId', ({ awsXAmznTraceId, patchedTraceIdPrefix, patchedTraceIdSuffix }) => {
     const result = utils.getPatchedTraceId(awsXAmznTraceId);
 
     const [resultRoot, resultTime, resultSuffix] = result.split('-');
-    expect(resultRoot).toEqual(expectedRoot);
-    expect(resultSuffix).toEqual(expectedSuffix);
+    expect(resultRoot).toEqual(patchedTraceIdPrefix);
+    expect(resultSuffix).toEqual(patchedTraceIdSuffix);
 
+    // getPatchedTraceId truncates to whole seconds, so timeDiff is Date.now()
+    // modulo 1000 and is legitimately 0 on an exact second boundary
     const timeDiff = Date.now() - 1000 * parseInt(resultTime, 16);
-    expect(timeDiff).toBeGreaterThan(0);
+    expect(timeDiff).toBeGreaterThanOrEqual(0);
     expect(timeDiff).toBeLessThan(1500);
   });
 
@@ -242,6 +327,12 @@ describe('utils', () => {
     expect(utils.isDebug()).toBe(true);
   });
 
+  test('isSecretMaskingDebug -> ENV VAR', () => {
+    expect(utils.isSecretMaskingDebug()).toBe(false);
+    process.env.LUMIGO_SECRET_MASKING_DEBUG = 'TRUE';
+    expect(utils.isSecretMaskingDebug()).toBe(true);
+  });
+
   test('isLambdaWrapped', () => {
     expect(utils.isLambdaWrapped()).toBe(false);
     process.env.LUMIGO_IS_WRAPPED = 'TRUE';
@@ -281,8 +372,8 @@ describe('utils', () => {
   });
 
   test('getEventEntitySize MAX_EVENT_ENTITY_SIZE', () => {
-    expect(utils.getEventEntitySize()).toBe(LUMIGO_MAX_ENTRY_SIZE);
-    expect(utils.getEventEntitySize(true)).toBe(LUMIGO_MAX_ENTRY_SIZE * 2);
+    expect(utils.getEventEntitySize()).toBe(DEFAULT_LUMIGO_MAX_ENTRY_SIZE);
+    expect(utils.getEventEntitySize(true)).toBe(DEFAULT_LUMIGO_MAX_ENTRY_SIZE * 2);
     process.env.MAX_EVENT_ENTITY_SIZE = '2048';
     expect(utils.getEventEntitySize()).toBe(2048);
   });
@@ -293,9 +384,30 @@ describe('utils', () => {
     expect(utils.getEventEntitySize()).toBe(2048);
   });
 
+  test('getEventEntitySize LUMIGO_MAX_ENTRY_SIZE_ON_ERROR', () => {
+    delete process.env.MAX_EVENT_ENTITY_SIZE_ON_ERROR;
+    process.env.LUMIGO_MAX_ENTRY_SIZE_ON_ERROR = '10000';
+    expect(utils.getEventEntitySize(true)).toBe(10000);
+  });
+
+  test('getEventEntitySize LUMIGO_MAX_ENTRY_SIZE_ON_ERROR is 2x LUMIGO_MAX_ENTRY_SIZE', () => {
+    delete process.env.MAX_EVENT_ENTITY_SIZE;
+    process.env.LUMIGO_MAX_ENTRY_SIZE = '4096';
+    expect(utils.getEventEntitySize(true)).toBe(4096 * 2);
+  });
+
   test('getEventEntitySize NaN', () => {
     process.env.MAX_EVENT_ENTITY_SIZE = 'A 2048';
-    expect(utils.getEventEntitySize()).toBe(LUMIGO_MAX_ENTRY_SIZE);
+    expect(utils.getEventEntitySize()).toBe(DEFAULT_LUMIGO_MAX_ENTRY_SIZE);
+  });
+
+  test('getStoredSpansMaxSize using env var value', () => {
+    const valueBefore = getMaxSizeForStoredSpansInMemory();
+    process.env[LUMIGO_STORED_SPANS_MAX_SIZE_BYTES_ENV_VAR] = `${valueBefore + 100}`;
+    expect(getMaxSizeForStoredSpansInMemory()).toBe(valueBefore);
+
+    process.env[LUMIGO_SUPPORT_LARGE_INVOCATIONS] = 'true';
+    expect(getMaxSizeForStoredSpansInMemory()).toBe(valueBefore + 100);
   });
 
   test('getConnectionTimeout => simple flow', () => {
@@ -745,6 +857,41 @@ describe('utils', () => {
     );
   });
 
+  test('removeLumigoFromStacktrace - unhandled promise exception', () => {
+    const err = {
+      stack:
+        'Error: Error: I am an error\n    ' +
+        'at /opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:269:31\n    ' +
+        'at step (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:33:23)\n    ' +
+        'at Object.next (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:14:53)\n    ' +
+        'at /opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:8:71\n    ' +
+        'at new Promise (<anonymous>)\n    ' +
+        'at __awaiter (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:4:12)\n    ' +
+        'at events.unhandledRejection (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:264:73)\n    ' +
+        'at process.emit (node:events:519:28)\n    ' +
+        'at emitUnhandledRejection (node:internal/process/promises:250:13)\n    ' +
+        'at throwUnhandledRejectionsMode (node:internal/process/promises:385:19)',
+    };
+
+    const data = 'abcd';
+    const type = '1234';
+    const handlerReturnValue = { err, data, type };
+
+    const expectedErr = {
+      stack:
+        'Error: Error: I am an error\n    ' +
+        'at new Promise (<anonymous>)\n    ' +
+        'at process.emit (node:events:519:28)\n    ' +
+        'at emitUnhandledRejection (node:internal/process/promises:250:13)\n    ' +
+        'at throwUnhandledRejectionsMode (node:internal/process/promises:385:19)',
+    };
+    const expectedHandlerReturnValue = { err: expectedErr, data, type };
+
+    expect(utils.removeLumigoFromStacktrace(handlerReturnValue)).toEqual(
+      expectedHandlerReturnValue
+    );
+  });
+
   test('removeLumigoFromStacktrace no exception', () => {
     utils.removeLumigoFromStacktrace(null);
     // No exception.
@@ -1075,5 +1222,107 @@ describe('utils', () => {
       aa: 1,
       bb: 2,
     });
+  });
+
+  test('safeExecuteAsync -> happy flow', async () => {
+    const result = await safeExecuteAsync({
+      fn: async () => 5,
+      message: 'test',
+      defaultReturn: 0,
+    })();
+    expect(result).toEqual(5);
+  });
+
+  test('safeExecuteAsync -> catch exception', async () => {
+    const result = await safeExecuteAsync({
+      fn: async () => {
+        throw new Error('Mocked error');
+      },
+      message: 'test',
+      defaultReturn: 0,
+    })();
+    expect(result).toEqual(0);
+  });
+
+  test('safeExecuteAsync -> multiple parameters', async () => {
+    const result = await safeExecuteAsync({
+      fn: async (a, b) => a + b,
+      message: 'test',
+      defaultReturn: 0,
+    })(2, 3);
+    expect(result).toEqual(5);
+  });
+
+  test('safeExecuteAsync -> multiple parameters in object', async () => {
+    const result = await safeExecuteAsync({
+      fn: async ({ a, b }) => a + b,
+      message: 'test',
+      defaultReturn: 0,
+    })({ a: 2, b: 3 });
+    expect(result).toEqual(5);
+  });
+
+  test('removelumigoFromError', () => {
+    const err = Error('Error: I am an error');
+    err.stack =
+      'Error: Error: I am an error\n    ' +
+      'at /opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:269:31\n    ' +
+      'at step (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:33:23)\n    ' +
+      'at Object.next (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:14:53)\n    ' +
+      'at /opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:8:71\n    ' +
+      'at new Promise (<anonymous>)\n    ' +
+      'at __awaiter (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:4:12)\n    ' +
+      'at events.unhandledRejection (/opt/nodejs/node_modules/@lumigo/tracer/dist/tracer/tracer.js:264:73)\n    ' +
+      'at process.emit (node:events:519:28)\n    ' +
+      'at emitUnhandledRejection (node:internal/process/promises:250:13)\n    ' +
+      'at throwUnhandledRejectionsMode (node:internal/process/promises:385:19)';
+
+    const expectedStack =
+      'Error: Error: I am an error\n    ' +
+      'at new Promise (<anonymous>)\n    ' +
+      'at process.emit (node:events:519:28)\n    ' +
+      'at emitUnhandledRejection (node:internal/process/promises:250:13)\n    ' +
+      'at throwUnhandledRejectionsMode (node:internal/process/promises:385:19)';
+    const result = removeLumigoFromError(err.stack);
+
+    expect(result).toEqual(expectedStack);
+  });
+
+  test('getNodeMajorVersion -> extracts version from AWS_EXECUTION_ENV', () => {
+    const originalEnv = process.env.AWS_EXECUTION_ENV;
+
+    process.env.AWS_EXECUTION_ENV = 'AWS_Lambda_nodejs20.x';
+    expect(getNodeMajorVersion()).toEqual(20);
+
+    process.env.AWS_EXECUTION_ENV = 'AWS_Lambda_nodejs24.x';
+    expect(getNodeMajorVersion()).toEqual(24);
+
+    process.env.AWS_EXECUTION_ENV = '';
+    expect(getNodeMajorVersion()).toEqual(0);
+
+    delete process.env.AWS_EXECUTION_ENV;
+    expect(getNodeMajorVersion()).toEqual(0);
+
+    process.env.AWS_EXECUTION_ENV = originalEnv;
+  });
+
+  test('supportsCallbackHandlers -> correctly determines callback support', () => {
+    const originalEnv = process.env.AWS_EXECUTION_ENV;
+
+    [18, 20, 22, 23].forEach((version) => {
+      process.env.AWS_EXECUTION_ENV = `AWS_Lambda_nodejs${version}.x`;
+      expect(utils.supportsCallbackHandlers()).toBe(true);
+    });
+
+    [24, 25, 30].forEach((version) => {
+      process.env.AWS_EXECUTION_ENV = `AWS_Lambda_nodejs${version}.x`;
+      expect(utils.supportsCallbackHandlers()).toBe(false);
+    });
+
+    delete process.env.AWS_EXECUTION_ENV;
+    expect(utils.supportsCallbackHandlers()).toBe(true);
+
+    // Restore
+    process.env.AWS_EXECUTION_ENV = originalEnv;
   });
 });

@@ -1,6 +1,11 @@
 import { ConsoleWritesForTesting } from '../testUtils/consoleMocker';
 import * as globals from './globals';
-import { DEFAULT_MAX_SIZE_FOR_REQUEST, MAX_TRACER_ADDED_DURATION_ALLOWED } from './globals';
+import {
+  DEFAULT_MAX_SIZE_FOR_REQUEST,
+  DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR,
+  DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
+  MAX_TRACER_ADDED_DURATION_ALLOWED,
+} from './globals';
 import { getMaxRequestSize } from './utils';
 
 describe('globals', () => {
@@ -14,8 +19,10 @@ describe('globals', () => {
     globals.SpansContainer.addSpan(span1);
     globals.SpansContainer.addSpan(span2);
     expect(globals.SpansContainer.getSpans()).toEqual([span1, span2]);
+    expect(globals.SpansContainer.getTotalSpans()).toEqual(2);
     globals.SpansContainer.clearSpans();
     expect(globals.SpansContainer.getSpans()).toEqual([]);
+    expect(globals.SpansContainer.getTotalSpans()).toEqual(0);
   });
 
   test('SpansContainer - override spans', () => {
@@ -24,6 +31,7 @@ describe('globals', () => {
     globals.SpansContainer.addSpan(span1);
     globals.SpansContainer.addSpan(span2);
     expect(globals.SpansContainer.getSpans()).toEqual([span2]);
+    expect(globals.SpansContainer.getTotalSpans()).toEqual(1);
   });
 
   test('SpansContainer - changeSpanId', () => {
@@ -31,10 +39,12 @@ describe('globals', () => {
     globals.SpansContainer.addSpan(span1);
     globals.SpansContainer.changeSpanId('1', '2');
     expect(globals.SpansContainer.getSpans()).toEqual([{ a: 'b', id: '2' }]);
+    expect(globals.SpansContainer.getTotalSpans()).toEqual(0);
   });
 
   test('SpansContainer - changeSpanId -> old span not exist', () => {
     globals.SpansContainer.changeSpanId('1', '2');
+    expect(globals.SpansContainer.getTotalSpans()).toEqual(0);
     //Nothing fails
   });
 
@@ -55,7 +65,7 @@ describe('globals', () => {
     expect(spans).toEqual([span1]);
   });
 
-  test('SpansContainer - cleanning the request size limiter', () => {
+  test('SpansContainer - cleaning the request size limiter', () => {
     const span1 = { a: 'b', c: 'd', id: '1' };
     for (let i = 0; i < getMaxRequestSize(); i++) {
       globals.SpansContainer.addSpan(span1);
@@ -228,6 +238,8 @@ describe('globals', () => {
     const edgeHost = 'zarathustra.com';
     const isStepFunction = false;
     const maxSizeForRequest = 1234;
+    const maxSizeForRequestOnError = 12345;
+    const maxSizeForStoredSpansInMemory = 1234567;
     globals.TracerGlobals.setTracerInputs({
       token,
       debug,
@@ -235,6 +247,8 @@ describe('globals', () => {
       switchOff,
       isStepFunction,
       maxSizeForRequest,
+      maxSizeForRequestOnError,
+      maxSizeForStoredSpansInMemory,
     });
     expect(globals.TracerGlobals.getTracerInputs()).toEqual({
       token,
@@ -244,6 +258,8 @@ describe('globals', () => {
       isStepFunction,
       lambdaTimeout: MAX_TRACER_ADDED_DURATION_ALLOWED,
       maxSizeForRequest,
+      maxSizeForRequestOnError,
+      maxSizeForStoredSpansInMemory,
     });
     globals.TracerGlobals.clearTracerInputs();
     expect(globals.TracerGlobals.getTracerInputs()).toEqual({
@@ -254,6 +270,8 @@ describe('globals', () => {
       switchOff: false,
       isStepFunction: false,
       maxSizeForRequest: DEFAULT_MAX_SIZE_FOR_REQUEST,
+      maxSizeForRequestOnError: DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR,
+      maxSizeForStoredSpansInMemory: DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
     });
   });
 
@@ -296,6 +314,8 @@ describe('globals', () => {
       isStepFunction: false,
       lambdaTimeout: MAX_TRACER_ADDED_DURATION_ALLOWED,
       maxSizeForRequest: DEFAULT_MAX_SIZE_FOR_REQUEST,
+      maxSizeForRequestOnError: DEFAULT_MAX_SIZE_FOR_REQUEST_ON_ERROR,
+      maxSizeForStoredSpansInMemory: DEFAULT_MAX_SIZE_FOR_SPANS_STORED_IN_MEMORY,
     });
   });
 
